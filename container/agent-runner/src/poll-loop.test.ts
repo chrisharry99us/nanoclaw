@@ -104,12 +104,10 @@ describe('routing', () => {
 
 describe('mock provider', () => {
   it('should produce init + result events', async () => {
-    const provider = new MockProvider((prompt) => `Echo: ${prompt}`);
+    const provider = new MockProvider({}, (prompt) => `Echo: ${prompt}`);
     const query = provider.query({
       prompt: 'Hello',
       cwd: '/tmp',
-      mcpServers: {},
-      env: {},
     });
 
     const events: Array<{ type: string }> = [];
@@ -127,12 +125,10 @@ describe('mock provider', () => {
   });
 
   it('should handle push() during active query', async () => {
-    const provider = new MockProvider((prompt) => `Re: ${prompt}`);
+    const provider = new MockProvider({}, (prompt) => `Re: ${prompt}`);
     const query = provider.query({
       prompt: 'First',
       cwd: '/tmp',
-      mcpServers: {},
-      env: {},
     });
 
     const events: Array<{ type: string; text?: string }> = [];
@@ -164,12 +160,10 @@ describe('end-to-end with mock provider', () => {
     const prompt = formatMessages(messages);
 
     // Create mock provider and run query
-    const provider = new MockProvider(() => 'The answer is 4');
+    const provider = new MockProvider({}, () => 'The answer is 4');
     const query = provider.query({
       prompt,
       cwd: '/tmp',
-      mcpServers: {},
-      env: {},
     });
 
     // Process events — simulate what poll-loop does

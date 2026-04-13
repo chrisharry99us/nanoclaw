@@ -3,7 +3,7 @@ import path from 'path';
 
 import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 
-import type { AgentProvider, AgentQuery, ProviderEvent, QueryInput } from './types.js';
+import type { AgentProvider, AgentQuery, McpServerConfig, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 
 function log(msg: string): void {
   console.error(`[claude-provider] ${msg}`);
@@ -161,31 +161,61 @@ function createPreCompactHook(assistantName?: string): HookCallback {
 
 // ── Provider ──
 
-export class ClaudeProvider implements AgentProvider {
-  private assistantName?: string;
+/**
+ * Claude Code auto-compacts context at this window (tokens). Kept here so
+ * the generic bootstrap doesn't need to know about Claude-specific env vars.
+ */
+const CLAUDE_CODE_AUTO_COMPACT_WINDOW = '165000';
 
-  constructor(opts?: { assistantName?: string }) {
-    this.assistantName = opts?.assistantName;
+/**
+ * Stale-session detection. Matches Claude Code's error text when a
+ * resumed session can't be found — missing transcript .jsonl, unknown
+ * session ID, etc.
+ */
+const STALE_SESSION_RE = /no conversation found|ENOENT.*\.jsonl|session.*not found/i;
+
+export class ClaudeProvider implements AgentProvider {
+  readonly supportsNativeSlashCommands = true;
+
+  private assistantName?: string;
+  private mcpServers: Record<string, McpServerConfig>;
+  private env: Record<string, string | undefined>;
+  private additionalDirectories?: string[];
+
+  constructor(options: ProviderOptions = {}) {
+    this.assistantName = options.assistantName;
+    this.mcpServers = options.mcpServers ?? {};
+    this.additionalDirectories = options.additionalDirectories;
+    this.env = {
+      ...(options.env ?? {}),
+      CLAUDE_CODE_AUTO_COMPACT_WINDOW,
+    };
+  }
+
+  isSessionInvalid(err: unknown): boolean {
+    const msg = err instanceof Error ? err.message : String(err);
+    return STALE_SESSION_RE.test(msg);
   }
 
   query(input: QueryInput): AgentQuery {
     const stream = new MessageStream();
     stream.push(input.prompt);
 
+    const instructions = input.systemContext?.instructions;
+
     const sdkResult = sdkQuery({
       prompt: stream,
       options: {
         cwd: input.cwd,
-        additionalDirectories: input.additionalDirectories,
-        resume: input.sessionId,
-        resumeSessionAt: input.resumeAt,
-        systemPrompt: input.systemPrompt ? { type: 'preset' as const, preset: 'claude_code' as const, append: input.systemPrompt } : undefined,
+        additionalDirectories: this.additionalDirectories,
+        resume: input.continuation,
+        systemPrompt: instructions ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions } : undefined,
         allowedTools: TOOL_ALLOWLIST,
-        env: input.env,
+        env: this.env,
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
         settingSources: ['project', 'user'],
-        mcpServers: input.mcpServers,
+        mcpServers: this.mcpServers,
         hooks: {
           PreCompact: [{ hooks: [createPreCompactHook(this.assistantName)] }],
         },
@@ -204,7 +234,7 @@ export class ClaudeProvider implements AgentProvider {
         yield { type: 'activity' };
 
         if (message.type === 'system' && message.subtype === 'init') {
-          yield { type: 'init', sessionId: message.session_id };
+          yield { type: 'init', continuation: message.session_id };
         } else if (message.type === 'result') {
           const text = 'result' in message ? (message as { result?: string }).result ?? null : null;
           yield { type: 'result', text };

@@ -1,32 +1,52 @@
 export interface AgentProvider {
+  /**
+   * True if the provider's underlying SDK handles slash commands natively and
+   * wants them passed through as raw text. When false, the poll-loop formats
+   * slash commands like any other chat message.
+   */
+  readonly supportsNativeSlashCommands: boolean;
+
   /** Start a new query. Returns a handle for streaming input and output. */
   query(input: QueryInput): AgentQuery;
+
+  /**
+   * True if the given error indicates the stored continuation is invalid
+   * (missing transcript, unknown session, etc.) and should be cleared.
+   */
+  isSessionInvalid(err: unknown): boolean;
+}
+
+/**
+ * Options passed to provider constructors. Fields are common to most
+ * providers; individual providers may ignore any they don't need.
+ */
+export interface ProviderOptions {
+  assistantName?: string;
+  mcpServers?: Record<string, McpServerConfig>;
+  env?: Record<string, string | undefined>;
+  additionalDirectories?: string[];
 }
 
 export interface QueryInput {
   /** Initial prompt (already formatted by agent-runner). */
   prompt: string;
 
-  /** Session ID to resume, if any. */
-  sessionId?: string;
-
-  /** Resume from a specific point in the session (provider-specific). */
-  resumeAt?: string;
+  /**
+   * Opaque continuation token from a previous query. The provider decides
+   * what this means (session ID, thread ID, nothing at all).
+   */
+  continuation?: string;
 
   /** Working directory inside the container. */
   cwd: string;
 
-  /** MCP server configurations. */
-  mcpServers: Record<string, McpServerConfig>;
-
-  /** System prompt / developer instructions. */
-  systemPrompt?: string;
-
-  /** Environment variables for the SDK process. */
-  env: Record<string, string | undefined>;
-
-  /** Additional directories the agent can access. */
-  additionalDirectories?: string[];
+  /**
+   * System context to inject. Providers translate this into whatever their
+   * SDK expects (preset append, full system prompt, per-turn injection…).
+   */
+  systemContext?: {
+    instructions?: string;
+  };
 }
 
 export interface McpServerConfig {
@@ -50,8 +70,13 @@ export interface AgentQuery {
 }
 
 export type ProviderEvent =
-  | { type: 'init'; sessionId: string }
+  | { type: 'init'; continuation: string }
   | { type: 'result'; text: string | null }
   | { type: 'error'; message: string; retryable: boolean; classification?: string }
   | { type: 'progress'; message: string }
+  /**
+   * Liveness signal. Providers MUST yield this on every underlying SDK
+   * event (tool call, thinking, partial message, anything) so the
+   * poll-loop's idle timer stays honest during long tool runs.
+   */
   | { type: 'activity' };

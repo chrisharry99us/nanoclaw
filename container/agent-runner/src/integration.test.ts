@@ -34,7 +34,7 @@ describe('poll loop integration', () => {
   it('should pick up a message, process it, and write a response', async () => {
     insertMessage('m1', { sender: 'Alice', text: 'What is the meaning of life?' }, { platformId: 'chan-1', channelType: 'discord', threadId: 'thread-1' });
 
-    const provider = new MockProvider(() => '<message to="discord-test">42</message>');
+    const provider = new MockProvider({}, () => '<message to="discord-test">42</message>');
 
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
@@ -60,7 +60,7 @@ describe('poll loop integration', () => {
     insertMessage('m1', { sender: 'Alice', text: 'Hello' });
     insertMessage('m2', { sender: 'Bob', text: 'World' });
 
-    const provider = new MockProvider(() => '<message to="discord-test">Got both messages</message>');
+    const provider = new MockProvider({}, () => '<message to="discord-test">Got both messages</message>');
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
 
@@ -75,7 +75,7 @@ describe('poll loop integration', () => {
   });
 
   it('should process messages arriving after loop starts', async () => {
-    const provider = new MockProvider(() => '<message to="discord-test">Processed</message>');
+    const provider = new MockProvider({}, () => '<message to="discord-test">Processed</message>');
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 3000);
 
@@ -99,8 +99,6 @@ async function runPollLoopWithTimeout(provider: MockProvider, signal: AbortSigna
     runPollLoop({
       provider,
       cwd: '/tmp',
-      mcpServers: {},
-      env: {},
     }),
     new Promise<void>((_, reject) => {
       signal.addEventListener('abort', () => reject(new Error('aborted')));

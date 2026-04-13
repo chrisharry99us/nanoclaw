@@ -1,14 +1,20 @@
-import type { AgentProvider, AgentQuery, ProviderEvent, QueryInput } from './types.js';
+import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 
 /**
  * Mock provider for testing. Returns canned responses.
  * Supports push() — queued messages produce additional results.
  */
 export class MockProvider implements AgentProvider {
+  readonly supportsNativeSlashCommands = false;
+
   private responseFactory: (prompt: string) => string;
 
-  constructor(responseFactory?: (prompt: string) => string) {
+  constructor(_options: ProviderOptions = {}, responseFactory?: (prompt: string) => string) {
     this.responseFactory = responseFactory ?? ((prompt) => `Mock response to: ${prompt.slice(0, 100)}`);
+  }
+
+  isSessionInvalid(_err: unknown): boolean {
+    return false;
   }
 
   query(input: QueryInput): AgentQuery {
@@ -21,7 +27,7 @@ export class MockProvider implements AgentProvider {
     const events: AsyncIterable<ProviderEvent> = {
       async *[Symbol.asyncIterator]() {
         yield { type: 'activity' };
-        yield { type: 'init', sessionId: `mock-session-${Date.now()}` };
+        yield { type: 'init', continuation: `mock-session-${Date.now()}` };
 
         // Process initial prompt
         yield { type: 'activity' };

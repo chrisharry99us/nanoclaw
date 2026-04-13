@@ -40,19 +40,18 @@ const GLOBAL_CLAUDE_MD = '/workspace/global/CLAUDE.md';
 async function main(): Promise<void> {
   const providerName = (process.env.AGENT_PROVIDER || 'claude') as ProviderName;
   const assistantName = process.env.NANOCLAW_ASSISTANT_NAME;
+  const adminUserId = process.env.NANOCLAW_ADMIN_USER_ID;
 
   log(`Starting v2 agent-runner (provider: ${providerName})`);
 
-  const provider = createProvider(providerName, { assistantName });
-
   // Load global CLAUDE.md as additional system context, then append destinations addendum
-  let systemPrompt: string | undefined;
+  let instructions: string | undefined;
   if (fs.existsSync(GLOBAL_CLAUDE_MD)) {
-    systemPrompt = fs.readFileSync(GLOBAL_CLAUDE_MD, 'utf-8');
+    instructions = fs.readFileSync(GLOBAL_CLAUDE_MD, 'utf-8');
     log('Loaded global CLAUDE.md');
   }
   const addendum = buildSystemPromptAddendum();
-  systemPrompt = systemPrompt ? `${systemPrompt}\n\n${addendum}` : addendum;
+  instructions = instructions ? `${instructions}\n\n${addendum}` : addendum;
 
   // Discover additional directories mounted at /workspace/extra/*
   const additionalDirectories: string[] = [];
@@ -72,12 +71,6 @@ async function main(): Promise<void> {
   // MCP server path
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'mcp-tools', 'index.js');
-
-  // SDK env
-  const env: Record<string, string | undefined> = {
-    ...process.env,
-    CLAUDE_CODE_AUTO_COMPACT_WINDOW: '165000',
-  };
 
   // Build MCP servers config: nanoclaw built-in + any additional from host
   const mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }> = {
@@ -105,13 +98,18 @@ async function main(): Promise<void> {
     }
   }
 
+  const provider = createProvider(providerName, {
+    assistantName,
+    mcpServers,
+    env: { ...process.env },
+    additionalDirectories: additionalDirectories.length > 0 ? additionalDirectories : undefined,
+  });
+
   await runPollLoop({
     provider,
     cwd: CWD,
-    mcpServers,
-    systemPrompt,
-    env,
-    additionalDirectories: additionalDirectories.length > 0 ? additionalDirectories : undefined,
+    systemContext: { instructions },
+    adminUserId,
   });
 }
 

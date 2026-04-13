@@ -4,7 +4,7 @@ import { writeMessageOut } from './db/messages-out.js';
 import { touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
 import { getStoredSessionId, setStoredSessionId, clearStoredSessionId } from './db/session-state.js';
 import { formatMessages, extractRouting, categorizeMessage, type RoutingContext } from './formatter.js';
-import type { AgentProvider, AgentQuery, McpServerConfig, ProviderEvent } from './providers/types.js';
+import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
@@ -21,10 +21,11 @@ function generateId(): string {
 export interface PollLoopConfig {
   provider: AgentProvider;
   cwd: string;
-  mcpServers: Record<string, McpServerConfig>;
-  systemPrompt?: string;
-  env: Record<string, string | undefined>;
-  additionalDirectories?: string[];
+  systemContext?: {
+    instructions?: string;
+  };
+  /** Admin user ID for permission checks on admin commands (e.g. /clear). */
+  adminUserId?: string;
 }
 
 /**
@@ -38,15 +39,14 @@ export interface PollLoopConfig {
  * 6. Loop
  */
 export async function runPollLoop(config: PollLoopConfig): Promise<void> {
-  // Resume the SDK session from a prior container run if one was persisted.
-  // The SDK's .jsonl transcripts live in the shared ~/.claude mount, so the
-  // conversation history is already on disk — we just need the session ID
-  // to tell the SDK which one to continue.
-  let sessionId: string | undefined = getStoredSessionId();
-  let resumeAt: string | undefined;
+  // Resume the agent's prior session from a previous container run if one
+  // was persisted. The continuation is opaque to the poll-loop — the
+  // provider decides how to use it (Claude resumes a .jsonl transcript,
+  // other providers may reload a thread ID, etc.).
+  let continuation: string | undefined = getStoredSessionId();
 
-  if (sessionId) {
-    log(`Resuming SDK session ${sessionId}`);
+  if (continuation) {
+    log(`Resuming agent session ${continuation}`);
   }
 
   // Clear leftover 'processing' acks from a previous crashed container.
@@ -75,7 +75,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const routing = extractRouting(messages);
 
     // Handle commands: categorize chat messages
-    const adminUserId = config.env.NANOCLAW_ADMIN_USER_ID;
+    const adminUserId = config.adminUserId;
     const normalMessages = [];
     const commandIds: string[] = [];
 
@@ -110,9 +110,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         }
         // Handle admin commands directly
         if (cmdInfo.command === '/clear') {
-          log('Clearing session (resetting sessionId)');
-          sessionId = undefined;
-          resumeAt = undefined;
+          log('Clearing session (resetting continuation)');
+          continuation = undefined;
           clearStoredSessionId();
           writeMessageOut({
             id: generateId(),
@@ -149,43 +148,37 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       continue;
     }
 
-    // Format messages: passthrough commands get raw text, others get XML
-    const prompt = formatMessagesWithCommands(normalMessages);
+    // Format messages: passthrough commands get raw text (only if the
+    // provider natively handles slash commands), others get XML.
+    const prompt = formatMessagesWithCommands(normalMessages, config.provider.supportsNativeSlashCommands);
 
     log(`Processing ${normalMessages.length} message(s), kinds: ${[...new Set(normalMessages.map((m) => m.kind))].join(',')}`);
 
     const query = config.provider.query({
       prompt,
-      sessionId,
-      resumeAt,
+      continuation,
       cwd: config.cwd,
-      mcpServers: config.mcpServers,
-      systemPrompt: config.systemPrompt,
-      env: config.env,
-      additionalDirectories: config.additionalDirectories,
+      systemContext: config.systemContext,
     });
 
     // Process the query while concurrently polling for new messages
     const processingIds = ids.filter((id) => !commandIds.includes(id));
     try {
       const result = await processQuery(query, routing, config, processingIds);
-      if (result.sessionId && result.sessionId !== sessionId) {
-        sessionId = result.sessionId;
-        setStoredSessionId(sessionId);
+      if (result.continuation && result.continuation !== continuation) {
+        continuation = result.continuation;
+        setStoredSessionId(continuation);
       }
-      if (result.resumeAt) resumeAt = result.resumeAt;
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       log(`Query error: ${errMsg}`);
 
-      // Stale/corrupt session recovery: if the SDK can't find the session
-      // we asked it to resume, clear the stored ID so the next attempt
-      // starts fresh. The transcript .jsonl can go missing after a crash
-      // mid-write, manual deletion, or disk-full.
-      if (sessionId && /no conversation found|ENOENT.*\.jsonl|session.*not found/i.test(errMsg)) {
-        log(`Stale session detected (${sessionId}) — clearing for next retry`);
-        sessionId = undefined;
-        resumeAt = undefined;
+      // Stale/corrupt continuation recovery: ask the provider whether
+      // this error means the stored continuation is unusable, and clear
+      // it so the next attempt starts fresh.
+      if (continuation && config.provider.isSessionInvalid(err)) {
+        log(`Stale session detected (${continuation}) — clearing for next retry`);
+        continuation = undefined;
         clearStoredSessionId();
       }
 
@@ -207,17 +200,16 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
 /**
  * Format messages, handling passthrough commands differently.
- * Passthrough commands (e.g., /foo) are sent raw (no XML wrapping).
- * Admin commands from authorized users are formatted as system commands.
- * Normal messages get standard XML formatting.
+ * When the provider handles slash commands natively (Claude Code),
+ * passthrough commands are sent raw (no XML wrapping) so the SDK can
+ * dispatch them. Otherwise they fall through to standard XML formatting.
  */
-function formatMessagesWithCommands(messages: MessageInRow[]): string {
-  // Check if any message is a passthrough command
+function formatMessagesWithCommands(messages: MessageInRow[], nativeSlashCommands: boolean): string {
   const parts: string[] = [];
   const normalBatch: MessageInRow[] = [];
 
   for (const msg of messages) {
-    if (msg.kind === 'chat' || msg.kind === 'chat-sdk') {
+    if (nativeSlashCommands && (msg.kind === 'chat' || msg.kind === 'chat-sdk')) {
       const cmdInfo = categorizeMessage(msg);
       if (cmdInfo.category === 'passthrough' || cmdInfo.category === 'admin') {
         // Flush normal batch first
@@ -241,12 +233,11 @@ function formatMessagesWithCommands(messages: MessageInRow[]): string {
 }
 
 interface QueryResult {
-  sessionId?: string;
-  resumeAt?: string;
+  continuation?: string;
 }
 
 async function processQuery(query: AgentQuery, routing: RoutingContext, config: PollLoopConfig, processingIds: string[]): Promise<QueryResult> {
-  let querySessionId: string | undefined;
+  let queryContinuation: string | undefined;
   let done = false;
   let lastEventTime = Date.now();
 
@@ -289,7 +280,7 @@ async function processQuery(query: AgentQuery, routing: RoutingContext, config: 
       touchHeartbeat();
 
       if (event.type === 'init') {
-        querySessionId = event.sessionId;
+        queryContinuation = event.continuation;
       } else if (event.type === 'result' && event.text) {
         dispatchResultText(event.text, routing);
       }
@@ -299,13 +290,13 @@ async function processQuery(query: AgentQuery, routing: RoutingContext, config: 
     clearInterval(pollHandle);
   }
 
-  return { sessionId: querySessionId };
+  return { continuation: queryContinuation };
 }
 
 function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
   switch (event.type) {
     case 'init':
-      log(`Session: ${event.sessionId}`);
+      log(`Session: ${event.continuation}`);
       break;
     case 'result':
       log(`Result: ${event.text ? event.text.slice(0, 200) : '(empty)'}`);

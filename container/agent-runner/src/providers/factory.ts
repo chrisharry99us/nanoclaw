@@ -1,15 +1,15 @@
-import type { AgentProvider } from './types.js';
+import type { AgentProvider, ProviderOptions } from './types.js';
 import { ClaudeProvider } from './claude.js';
 import { MockProvider } from './mock.js';
 
 export type ProviderName = 'claude' | 'mock';
 
-export function createProvider(name: ProviderName, opts?: { assistantName?: string }): AgentProvider {
+export function createProvider(name: ProviderName, options: ProviderOptions = {}): AgentProvider {
   switch (name) {
     case 'claude':
-      return new ClaudeProvider(opts);
+      return new ClaudeProvider(options);
     case 'mock':
-      return new MockProvider();
+      return new MockProvider(options);
     default:
       throw new Error(`Unknown provider: ${name}`);
   }
