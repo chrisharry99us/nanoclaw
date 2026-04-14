@@ -319,7 +319,12 @@ async function deliverMessage(
       log.warn('Agent message missing target agent group ID', { id: msg.id });
       return;
     }
-    if (!hasDestination(session.agent_group_id, 'agent', targetAgentGroupId)) {
+    // Self-messages are always allowed — used for system notes injected back
+    // into an agent's own session (e.g. post-approval follow-up prompts).
+    if (
+      targetAgentGroupId !== session.agent_group_id &&
+      !hasDestination(session.agent_group_id, 'agent', targetAgentGroupId)
+    ) {
       log.warn('Unauthorized agent-to-agent message — dropping', {
         source: session.agent_group_id,
         target: targetAgentGroupId,
