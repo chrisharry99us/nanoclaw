@@ -6,9 +6,17 @@ set -euo pipefail
 # This is the only bash script in the setup flow.
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOG_FILE="$PROJECT_ROOT/logs/setup.log"
 
-mkdir -p "$PROJECT_ROOT/logs"
+# Where verbose bootstrap logs go. nanoclaw.sh captures setup.sh's stdout to
+# the per-step raw log, but legacy code in this script + install-node.sh
+# also calls `log` which writes to a file. Route those to the raw log so
+# they don't contaminate the progression log (logs/setup.log).
+# Default: write to the raw bootstrap log if nanoclaw.sh pointed us there,
+# else fall back to a dedicated bootstrap log (keeps standalone `bash
+# setup.sh` invocations working).
+LOG_FILE="${NANOCLAW_BOOTSTRAP_LOG:-${PROJECT_ROOT}/logs/bootstrap.log}"
+
+mkdir -p "$(dirname "$LOG_FILE")"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [bootstrap] $*" >> "$LOG_FILE"; }
 

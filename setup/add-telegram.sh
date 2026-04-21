@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-set -euo pipefail
-
-# Install the Telegram adapter (Phase A of the /add-telegram skill), collect
-# the bot token, write .env + data/env/env, and restart the service so the
-# new adapter is live. Idempotent.
 #
-# Pair-telegram (the interactive code-sending step) is run separately by the
-# caller (setup/auto.ts) so it can stream status blocks to the user.
+# Install the Telegram adapter, persist the bot token to .env + data/env/env,
+# restart the service, and open the bot's chat page in the local Telegram
+# client. Non-interactive — the operator-facing "Create a bot" instructions
+# and token paste live in setup/auto.ts. The token comes in via the
+# TELEGRAM_BOT_TOKEN env var.
+#
+# Emits exactly one status block on stdout (ADD_TELEGRAM) at the end. All
+# chatty progress messages go to stderr so setup:auto's raw-log capture
+# sees the full story without cluttering the final block for the parser.
+set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
@@ -15,19 +18,49 @@ cd "$PROJECT_ROOT"
 ADAPTER_VERSION="@chat-adapter/telegram@4.26.0"
 CHANNELS_BRANCH="origin/channels"
 
+emit_status() {
+  local status=$1 error=${2:-}
+  local already=${ADAPTER_ALREADY_INSTALLED:-false}
+  local username=${BOT_USERNAME:-}
+  echo "=== NANOCLAW SETUP: ADD_TELEGRAM ==="
+  echo "STATUS: ${status}"
+  echo "ADAPTER_VERSION: ${ADAPTER_VERSION}"
+  echo "ADAPTER_ALREADY_INSTALLED: ${already}"
+  [ -n "$username" ] && echo "BOT_USERNAME: ${username}"
+  [ -n "$error" ] && echo "ERROR: ${error}"
+  echo "=== END ==="
+}
+
+log() { echo "[add-telegram] $*" >&2; }
+
+if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
+  emit_status failed "TELEGRAM_BOT_TOKEN env var not set"
+  exit 1
+fi
+
+if ! [[ "$TELEGRAM_BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]{35,}$ ]]; then
+  emit_status failed "token format invalid (expected <digits>:<chars>)"
+  exit 1
+fi
+
 need_install() {
-  [[ ! -f src/channels/telegram.ts ]] && return 0
+  [ ! -f src/channels/telegram.ts ] && return 0
   ! grep -q "^import './telegram.js';" src/channels/index.ts 2>/dev/null && return 0
   return 1
 }
 
+ADAPTER_ALREADY_INSTALLED=true
 if need_install; then
-  echo "[add-telegram] Fetching channels branch…"
-  git fetch origin channels >/dev/null 2>&1
+  ADAPTER_ALREADY_INSTALLED=false
+  log "Fetching channels branch…"
+  git fetch origin channels >&2 2>/dev/null || {
+    emit_status failed "git fetch origin channels failed"
+    exit 1
+  }
 
   # pair-telegram.ts is maintained in this branch (setup-auto), so it's NOT
   # in this list — do not overwrite the local version with the channels copy.
-  echo "[add-telegram] Copying adapter files from ${CHANNELS_BRANCH}…"
+  log "Copying adapter files from ${CHANNELS_BRANCH}…"
   for f in \
     src/channels/telegram.ts \
     src/channels/telegram-pairing.ts \
@@ -35,7 +68,7 @@ if need_install; then
     src/channels/telegram-markdown-sanitize.ts \
     src/channels/telegram-markdown-sanitize.test.ts
   do
-    git show "$CHANNELS_BRANCH:$f" > "$f"
+    git show "${CHANNELS_BRANCH}:$f" > "$f"
   done
 
   # Append self-registration import if missing.
@@ -59,109 +92,71 @@ if need_install; then
     }
   '
 
-  echo "[add-telegram] Installing ${ADAPTER_VERSION}…"
-  pnpm install "$ADAPTER_VERSION"
+  log "Installing ${ADAPTER_VERSION}…"
+  pnpm install "${ADAPTER_VERSION}" >&2 2>/dev/null || {
+    emit_status failed "pnpm install ${ADAPTER_VERSION} failed"
+    exit 1
+  }
 
-  echo "[add-telegram] Building…"
-  pnpm run build >/dev/null
+  log "Building…"
+  pnpm run build >&2 2>/dev/null || {
+    emit_status failed "pnpm run build failed"
+    exit 1
+  }
 else
-  echo "[add-telegram] Adapter files already installed — skipping install phase."
+  log "Adapter files already installed — skipping install phase."
 fi
 
-# Token collection.
-if grep -q '^TELEGRAM_BOT_TOKEN=.' .env 2>/dev/null; then
-  echo "[add-telegram] TELEGRAM_BOT_TOKEN already set in .env — skipping token prompt."
+# Persist token. auto.ts validates before this point, so a bad token here
+# would be an internal bug rather than operator input.
+touch .env
+if grep -q '^TELEGRAM_BOT_TOKEN=' .env; then
+  awk -v tok="$TELEGRAM_BOT_TOKEN" \
+      '/^TELEGRAM_BOT_TOKEN=/{print "TELEGRAM_BOT_TOKEN=" tok; next} {print}' \
+    .env > .env.tmp && mv .env.tmp .env
 else
-  cat <<'EOF'
-
-── Create a Telegram bot ──────────────────────────────────────
-
-  1. Open Telegram and message @BotFather
-  2. Send: /newbot
-  3. Follow the prompts (bot name, username ending in "bot")
-  4. Copy the token it gives you (format: <digits>:<chars>)
-
-Optional but recommended for groups:
-  5. @BotFather → /mybots → your bot → Bot Settings → Group Privacy → OFF
-
-EOF
-  echo "Paste your TELEGRAM_BOT_TOKEN and press Enter."
-  echo "Nothing will appear on the screen as you paste — that's intentional."
-  echo "Paste once, then just press Enter to submit."
-  read -r -s -p "> " TOKEN </dev/tty
-  echo
-
-  if [[ -z "$TOKEN" ]]; then
-    echo "[add-telegram] No token entered. Aborting." >&2
-    exit 1
-  fi
-
-  # Telegram bot tokens: <digits>:<35+ base64url-ish chars>.
-  if [[ ! "$TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]{35,}$ ]]; then
-    echo "[add-telegram] Token format looks wrong (expected <digits>:<chars>). Aborting." >&2
-    exit 1
-  fi
-
-  touch .env
-  if grep -q '^TELEGRAM_BOT_TOKEN=' .env; then
-    awk -v tok="$TOKEN" '/^TELEGRAM_BOT_TOKEN=/{print "TELEGRAM_BOT_TOKEN=" tok; next} {print}' \
-      .env > .env.tmp && mv .env.tmp .env
-  else
-    echo "TELEGRAM_BOT_TOKEN=$TOKEN" >> .env
-  fi
+  echo "TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}" >> .env
 fi
 
-# Validate the token via getMe so a typo surfaces before we restart the
-# service, and capture the bot's username for the deep link.
-TELEGRAM_BOT_TOKEN_VALUE="$(grep '^TELEGRAM_BOT_TOKEN=' .env | head -1 | cut -d= -f2-)"
+# Look up the bot username (auto.ts already validated; we re-query here so
+# standalone invocations still work).
+INFO=$(curl -fsS --max-time 8 \
+  "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" 2>/dev/null || true)
 BOT_USERNAME=""
-if [[ -n "$TELEGRAM_BOT_TOKEN_VALUE" ]]; then
-  INFO=$(curl -fsS --max-time 8 \
-    "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN_VALUE}/getMe" 2>/dev/null || true)
-  if echo "$INFO" | grep -q '"ok":true'; then
-    # Crude JSON parse — the response is always a flat object here.
-    BOT_USERNAME=$(echo "$INFO" | sed -nE 's/.*"username":"([^"]+)".*/\1/p')
-    if [[ -n "$BOT_USERNAME" ]]; then
-      echo "[add-telegram] Token validated — bot is @${BOT_USERNAME}."
-    fi
-  else
-    echo "[add-telegram] Warning: getMe did not return ok. Continuing, but the token may be wrong."
-  fi
+if echo "$INFO" | grep -q '"ok":true'; then
+  BOT_USERNAME=$(echo "$INFO" | sed -nE 's/.*"username":"([^"]+)".*/\1/p')
 fi
 
 # Container reads from data/env/env (the host mounts it).
 mkdir -p data/env
 cp .env data/env/env
 
-# Deep-link into the bot's chat in the installed Telegram app so the user
-# is already on the right screen when pair-telegram prints the code. Also
-# always print the URL so headless / remote-SSH users can open it manually.
-if [[ -n "$BOT_USERNAME" ]]; then
-  BOT_URL="https://t.me/${BOT_USERNAME}"
+# Deep-link into the bot's chat so the user is already on the right screen
+# when pair-telegram prints the code. Silent best-effort — runs under a
+# spinner, any output (from `open` / `xdg-open`) goes to the raw log.
+if [ -n "$BOT_USERNAME" ]; then
   case "$(uname -s)" in
     Darwin)
-      open "tg://resolve?domain=${BOT_USERNAME}" >/dev/null 2>&1 \
-        || open "$BOT_URL" >/dev/null 2>&1 \
+      open "tg://resolve?domain=${BOT_USERNAME}" >&2 2>/dev/null \
+        || open "https://t.me/${BOT_USERNAME}" >&2 2>/dev/null \
         || true
       ;;
     Linux)
-      xdg-open "tg://resolve?domain=${BOT_USERNAME}" >/dev/null 2>&1 \
-        || xdg-open "$BOT_URL" >/dev/null 2>&1 \
+      xdg-open "tg://resolve?domain=${BOT_USERNAME}" >&2 2>/dev/null \
+        || xdg-open "https://t.me/${BOT_USERNAME}" >&2 2>/dev/null \
         || true
       ;;
   esac
-  echo "[add-telegram] Bot chat: ${BOT_URL}"
-  echo "[add-telegram] (If Telegram didn't open automatically, click the link above.)"
 fi
 
-echo "[add-telegram] Restarting service so the new adapter picks up the token…"
+log "Restarting service so the new adapter picks up the token…"
 case "$(uname -s)" in
   Darwin)
-    launchctl kickstart -k "gui/$(id -u)/com.nanoclaw" >/dev/null 2>&1 || true
+    launchctl kickstart -k "gui/$(id -u)/com.nanoclaw" >&2 2>/dev/null || true
     ;;
   Linux)
-    systemctl --user restart nanoclaw >/dev/null 2>&1 \
-      || sudo systemctl restart nanoclaw >/dev/null 2>&1 \
+    systemctl --user restart nanoclaw >&2 2>/dev/null \
+      || sudo systemctl restart nanoclaw >&2 2>/dev/null \
       || true
     ;;
 esac
@@ -170,4 +165,4 @@ esac
 # begins polling for the user's code message.
 sleep 5
 
-echo "[add-telegram] Install + credentials complete."
+emit_status success

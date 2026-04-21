@@ -26,12 +26,18 @@
  * with inherited stdio — clack resumes cleanly on the next step.
  */
 import { spawn, spawnSync } from 'child_process';
+import fs from 'fs';
 
 import * as p from '@clack/prompts';
 import k from 'kleur';
 
+import * as setupLog from './logs.js';
+
 const CLI_AGENT_NAME = 'Terminal Agent';
 const DEFAULT_AGENT_NAME = 'Nano';
+
+const RUN_START = Date.now();
+let failingStep = 'setup';
 
 /**
  * Brand palette, pulled from assets/nanoclaw-logo.png:
@@ -123,14 +129,16 @@ class StatusStream {
 }
 
 /**
- * Spawn a setup step as a child process, swallowing stdout/stderr into a
- * buffer. The provided onBlock callback fires per status block as they
- * parse. Returns when the child exits.
+ * Spawn a setup step as a child process. Output is tee'd to the provided
+ * raw log file (level 3) and parsed for status blocks (level 2 summary).
+ * The onBlock callback fires per status block as they close so the UI can
+ * react mid-stream.
  */
 function spawnStep(
   stepName: string,
   extra: string[],
   onBlock: (block: Block) => void,
+  rawLogPath: string,
 ): Promise<StepResult> {
   return new Promise((resolve) => {
     const args = ['exec', 'tsx', 'setup/index.ts', '--step', stepName];
@@ -138,13 +146,20 @@ function spawnStep(
 
     const child = spawn('pnpm', args, { stdio: ['ignore', 'pipe', 'pipe'] });
     const stream = new StatusStream(onBlock);
+    const raw = fs.createWriteStream(rawLogPath, { flags: 'w' });
+    raw.write(`# ${stepName} — ${new Date().toISOString()}\n\n`);
 
-    child.stdout.on('data', (chunk: Buffer) => stream.write(chunk.toString('utf-8')));
+    child.stdout.on('data', (chunk: Buffer) => {
+      stream.write(chunk.toString('utf-8'));
+      raw.write(chunk);
+    });
     child.stderr.on('data', (chunk: Buffer) => {
       stream.transcript += chunk.toString('utf-8');
+      raw.write(chunk);
     });
 
     child.on('close', (code) => {
+      raw.end();
       // Step block types don't always mirror step names (e.g. `mounts` emits
       // CONFIGURE_MOUNTS, `container` emits SETUP_CONTAINER). Any block with
       // a STATUS field is a terminal block; the last one wins.
@@ -170,22 +185,90 @@ type SpinnerLabels = {
   failed?: string;
 };
 
-/** Run a step under a clack spinner. Child output is captured; shown only on failure. */
+/** Run a step under a clack spinner. Teed to a per-step raw log + progression entry at the end. */
 async function runQuietStep(
   stepName: string,
   labels: SpinnerLabels,
   extra: string[] = [],
-): Promise<StepResult> {
-  return runUnderSpinner(labels, () => spawnStep(stepName, extra, () => {}));
+): Promise<StepResult & { rawLog: string; durationMs: number }> {
+  failingStep = stepName;
+  const rawLog = setupLog.stepRawLog(stepName);
+  const start = Date.now();
+  const result = await runUnderSpinner(labels, () =>
+    spawnStep(stepName, extra, () => {}, rawLog),
+  );
+  const durationMs = Date.now() - start;
+  writeStepEntry(stepName, result, durationMs, rawLog);
+  return { ...result, rawLog, durationMs };
 }
 
-/** Run an arbitrary child under a spinner, capturing its stdout/stderr. */
+/** Run an arbitrary child under a spinner. Same raw-log + progression treatment as runQuietStep. */
 async function runQuietChild(
+  logName: string,
   cmd: string,
   args: string[],
   labels: SpinnerLabels,
-): Promise<{ ok: boolean; exitCode: number; transcript: string }> {
-  return runUnderSpinner(labels, () => spawnQuiet(cmd, args));
+  opts?: {
+    /** Extra fields to merge into the progression entry (on top of any status-block fields). */
+    extraFields?: Record<string, string | number | boolean>;
+    /** Environment overrides to pass to the child process. */
+    env?: NodeJS.ProcessEnv;
+  },
+): Promise<{
+  ok: boolean;
+  exitCode: number;
+  transcript: string;
+  terminal: Block | null;
+  rawLog: string;
+  durationMs: number;
+}> {
+  failingStep = logName;
+  const rawLog = setupLog.stepRawLog(logName);
+  const start = Date.now();
+  const result = await runUnderSpinner(labels, () =>
+    spawnQuiet(cmd, args, rawLog, opts?.env),
+  );
+  const durationMs = Date.now() - start;
+
+  const blockFields = summariseTerminalFields(result.terminal);
+  const fields = { ...blockFields, ...(opts?.extraFields ?? {}) };
+  const rawStatus = result.terminal?.fields.STATUS;
+  const status: 'success' | 'skipped' | 'failed' = !result.ok
+    ? 'failed'
+    : rawStatus === 'skipped'
+      ? 'skipped'
+      : 'success';
+  setupLog.step(logName, status, durationMs, fields, rawLog);
+  return { ...result, rawLog, durationMs };
+}
+
+/** Turn a step's terminal-block fields into a concise progression-log entry. */
+function writeStepEntry(
+  stepName: string,
+  result: StepResult,
+  durationMs: number,
+  rawLog: string,
+): void {
+  const rawStatus = result.terminal?.fields.STATUS;
+  const logStatus: 'success' | 'skipped' | 'failed' = !result.ok
+    ? 'failed'
+    : rawStatus === 'skipped'
+      ? 'skipped'
+      : 'success';
+  const fields = summariseTerminalFields(result.terminal);
+  setupLog.step(stepName, logStatus, durationMs, fields, rawLog);
+}
+
+/** Strip STATUS + LOG (redundant) and any oversize values from the terminal block's fields. */
+function summariseTerminalFields(block: Block | null): Record<string, string> {
+  if (!block) return {};
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(block.fields)) {
+    if (k === 'STATUS' || k === 'LOG') continue;
+    if (v.length > 120) continue; // keep it skimmable; full value lives in the raw log
+    out[k] = v;
+  }
+  return out;
 }
 
 async function runUnderSpinner<
@@ -221,14 +304,34 @@ async function runUnderSpinner<
 function spawnQuiet(
   cmd: string,
   args: string[],
-): Promise<{ ok: boolean; exitCode: number; transcript: string }> {
+  rawLogPath: string,
+  envOverride?: NodeJS.ProcessEnv,
+): Promise<{ ok: boolean; exitCode: number; transcript: string; terminal: Block | null; blocks: Block[] }> {
   return new Promise((resolve) => {
-    const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(cmd, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: envOverride ? { ...process.env, ...envOverride } : process.env,
+    });
     let transcript = '';
-    child.stdout.on('data', (c: Buffer) => { transcript += c.toString('utf-8'); });
-    child.stderr.on('data', (c: Buffer) => { transcript += c.toString('utf-8'); });
+    const raw = fs.createWriteStream(rawLogPath, { flags: 'w' });
+    raw.write(`# ${[cmd, ...args].join(' ')} — ${new Date().toISOString()}\n\n`);
+    const blocks: Block[] = [];
+    const stream = new StatusStream((b) => blocks.push(b));
+    child.stdout.on('data', (c: Buffer) => {
+      const s = c.toString('utf-8');
+      transcript += s;
+      stream.write(s);
+      raw.write(c);
+    });
+    child.stderr.on('data', (c: Buffer) => {
+      transcript += c.toString('utf-8');
+      raw.write(c);
+    });
     child.on('close', (code) => {
-      resolve({ ok: code === 0, exitCode: code ?? 1, transcript });
+      raw.end();
+      const terminal =
+        [...blocks].reverse().find((b) => b.fields.STATUS) ?? null;
+      resolve({ ok: code === 0, exitCode: code ?? 1, transcript, terminal, blocks });
     });
   });
 }
@@ -248,15 +351,17 @@ function dumpTranscriptOnFailure(transcript: string): void {
 }
 
 function fail(msg: string, hint?: string): never {
+  setupLog.abort(failingStep, msg);
   p.log.error(msg);
   if (hint) p.log.message(k.dim(hint));
-  p.log.message(k.dim('Logs: logs/setup.log'));
+  p.log.message(k.dim('Logs: logs/setup.log · Raw: logs/setup-steps/'));
   p.cancel('Setup aborted.');
   process.exit(1);
 }
 
 function ensureAnswer<T>(value: T | symbol): T {
   if (p.isCancel(value)) {
+    setupLog.abort(failingStep, 'user-cancelled');
     p.cancel('Setup cancelled.');
     process.exit(0);
   }
@@ -317,7 +422,10 @@ function formatCodeCard(code: string): string {
   ].join('\n');
 }
 
-async function runPairTelegram(): Promise<StepResult> {
+async function runPairTelegram(): Promise<StepResult & { rawLog: string; durationMs: number }> {
+  failingStep = 'pair-telegram';
+  const rawLog = setupLog.stepRawLog('pair-telegram');
+  const start = Date.now();
   const s = p.spinner();
   s.start('Creating pairing code…');
   let spinnerActive = true;
@@ -329,29 +437,35 @@ async function runPairTelegram(): Promise<StepResult> {
     }
   };
 
-  const result = await spawnStep('pair-telegram', ['--intent', 'main'], (block) => {
-    if (block.type === 'PAIR_TELEGRAM_CODE') {
-      const reason = block.fields.REASON ?? 'initial';
-      if (reason === 'initial') {
-        stopSpinner('Pairing code ready.');
-      } else {
-        stopSpinner('Previous code invalidated. New code below.');
+  const result = await spawnStep(
+    'pair-telegram',
+    ['--intent', 'main'],
+    (block) => {
+      if (block.type === 'PAIR_TELEGRAM_CODE') {
+        const reason = block.fields.REASON ?? 'initial';
+        if (reason === 'initial') {
+          stopSpinner('Pairing code ready.');
+        } else {
+          stopSpinner('Previous code invalidated. New code below.');
+        }
+        p.note(formatCodeCard(block.fields.CODE ?? '????'), 'Pairing code');
+        s.start('Waiting for the code from Telegram…');
+        spinnerActive = true;
+      } else if (block.type === 'PAIR_TELEGRAM_ATTEMPT') {
+        stopSpinner(`Received "${block.fields.CANDIDATE ?? '?'}" — doesn't match.`);
+        s.start('Waiting for the correct code…');
+        spinnerActive = true;
+      } else if (block.type === 'PAIR_TELEGRAM') {
+        if (block.fields.STATUS === 'success') {
+          stopSpinner('Telegram paired.');
+        } else {
+          stopSpinner(`Pairing failed: ${block.fields.ERROR ?? 'unknown'}`, 1);
+        }
       }
-      p.note(formatCodeCard(block.fields.CODE ?? '????'), 'Pairing code');
-      s.start('Waiting for the code from Telegram…');
-      spinnerActive = true;
-    } else if (block.type === 'PAIR_TELEGRAM_ATTEMPT') {
-      stopSpinner(`Received "${block.fields.CANDIDATE ?? '?'}" — doesn't match.`);
-      s.start('Waiting for the correct code…');
-      spinnerActive = true;
-    } else if (block.type === 'PAIR_TELEGRAM') {
-      if (block.fields.STATUS === 'success') {
-        stopSpinner('Telegram paired.');
-      } else {
-        stopSpinner(`Pairing failed: ${block.fields.ERROR ?? 'unknown'}`, 1);
-      }
-    }
-  });
+    },
+    rawLog,
+  );
+  const durationMs = Date.now() - start;
 
   // Safety net: if the child died without emitting a terminal block, make
   // sure we don't leave the spinner running.
@@ -359,7 +473,9 @@ async function runPairTelegram(): Promise<StepResult> {
     stopSpinner(result.ok ? 'Done.' : 'Pairing exited unexpectedly.', result.ok ? 0 : 1);
     if (!result.ok) dumpTranscriptOnFailure(result.transcript);
   }
-  return result;
+
+  writeStepEntry('pair-telegram', result, durationMs, rawLog);
+  return { ...result, rawLog, durationMs };
 }
 
 async function askDisplayName(fallback: string): Promise<string> {
@@ -370,7 +486,9 @@ async function askDisplayName(fallback: string): Promise<string> {
       defaultValue: fallback,
     }),
   );
-  return (answer as string).trim() || fallback;
+  const value = (answer as string).trim() || fallback;
+  setupLog.userInput('display_name', value);
+  return value;
 }
 
 async function askAgentName(fallback: string): Promise<string> {
@@ -381,7 +499,9 @@ async function askAgentName(fallback: string): Promise<string> {
       defaultValue: fallback,
     }),
   );
-  return (answer as string).trim() || fallback;
+  const value = (answer as string).trim() || fallback;
+  setupLog.userInput('agent_name', value);
+  return value;
 }
 
 async function askChannelChoice(): Promise<'telegram' | 'skip'> {
@@ -394,7 +514,92 @@ async function askChannelChoice(): Promise<'telegram' | 'skip'> {
       ],
     }),
   );
+  setupLog.userInput('channel_choice', String(choice));
   return choice as 'telegram' | 'skip';
+}
+
+async function collectTelegramToken(): Promise<string> {
+  p.note(
+    [
+      '1. Open Telegram and message @BotFather',
+      '2. Send: /newbot',
+      '3. Follow the prompts (name + username ending in "bot")',
+      '4. Copy the token it gives you (format: <digits>:<chars>)',
+      '',
+      k.dim('Optional, but recommended for groups:'),
+      k.dim('    @BotFather → /mybots → Bot Settings → Group Privacy → OFF'),
+    ].join('\n'),
+    'Create a Telegram bot',
+  );
+
+  const answer = ensureAnswer(
+    await p.password({
+      message: 'Paste your bot token',
+      validate: (v) => {
+        if (!v || !v.trim()) return 'Token is required';
+        if (!/^[0-9]+:[A-Za-z0-9_-]{35,}$/.test(v.trim())) {
+          return 'Format looks wrong — expected <digits>:<chars>';
+        }
+        return undefined;
+      },
+    }),
+  );
+  const token = (answer as string).trim();
+  setupLog.userInput(
+    'telegram_token',
+    `${token.slice(0, 12)}…${token.slice(-4)}`,
+  );
+  return token;
+}
+
+async function validateTelegramToken(token: string): Promise<string> {
+  failingStep = 'telegram-validate';
+  const s = p.spinner();
+  const start = Date.now();
+  s.start('Validating token with Telegram…');
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${token}/getMe`);
+    const data = (await res.json()) as {
+      ok?: boolean;
+      result?: { username?: string; id?: number };
+      description?: string;
+    };
+    const elapsed = Math.round((Date.now() - start) / 1000);
+    if (data.ok && data.result?.username) {
+      const username = data.result.username;
+      s.stop(`Bot is @${username}. ${k.dim(`(${elapsed}s)`)}`);
+      setupLog.step(
+        'telegram-validate',
+        'success',
+        Date.now() - start,
+        { BOT_USERNAME: username, BOT_ID: data.result.id ?? '' },
+      );
+      return username;
+    }
+    const reason = data.description ?? 'token rejected by Telegram';
+    s.stop(`Telegram rejected the token: ${reason}`, 1);
+    setupLog.step(
+      'telegram-validate',
+      'failed',
+      Date.now() - start,
+      { ERROR: reason },
+    );
+    fail(
+      'Telegram rejected the token.',
+      'Double-check the token (copy it again from @BotFather) and retry.',
+    );
+  } catch (err) {
+    const elapsed = Math.round((Date.now() - start) / 1000);
+    s.stop(`Could not reach Telegram. ${k.dim(`(${elapsed}s)`)}`, 1);
+    const message = err instanceof Error ? err.message : String(err);
+    setupLog.step('telegram-validate', 'failed', Date.now() - start, {
+      ERROR: message,
+    });
+    fail(
+      'Telegram API unreachable.',
+      'Check your network connection and retry.',
+    );
+  }
 }
 
 function printIntro(): void {
@@ -414,6 +619,7 @@ function printIntro(): void {
 
 async function main(): Promise<void> {
   printIntro();
+  initProgressionLog();
 
   const skip = new Set(
     (process.env.NANOCLAW_SKIP ?? '')
@@ -479,22 +685,28 @@ async function main(): Promise<void> {
   }
 
   if (!skip.has('auth')) {
+    failingStep = 'auth';
     if (anthropicSecretExists()) {
       p.log.success('OneCLI already has an Anthropic secret — skipping.');
+      setupLog.step('auth', 'skipped', 0, { REASON: 'secret-already-present' });
     } else {
       p.log.step('Registering your Anthropic credential…');
       console.log(
         k.dim('   (browser sign-in or paste a token/key — this part is interactive)'),
       );
       console.log();
+      const start = Date.now();
       const code = await runInheritScript('bash', ['setup/register-claude-token.sh']);
+      const durationMs = Date.now() - start;
       console.log();
       if (code !== 0) {
+        setupLog.step('auth', 'failed', durationMs, { EXIT_CODE: code });
         fail(
           'Anthropic credential registration failed or was aborted.',
           'Re-run `bash setup/register-claude-token.sh` or handle via `/setup` §4.',
         );
       }
+      setupLog.step('auth', 'interactive', durationMs, { METHOD: 'register-claude-token.sh' });
       p.log.success('Anthropic credential registered with OneCLI.');
     }
   }
@@ -558,17 +770,28 @@ async function main(): Promise<void> {
   if (!skip.has('channel')) {
     const choice = await askChannelChoice();
     if (choice === 'telegram') {
-      p.log.step('Installing the Telegram adapter and collecting your bot token…');
-      console.log();
-      const installCode = await runInheritScript('bash', ['setup/add-telegram.sh']);
-      console.log();
-      if (installCode !== 0) {
+      const token = await collectTelegramToken();
+      const botUsername = await validateTelegramToken(token);
+
+      const install = await runQuietChild(
+        'telegram-install',
+        'bash',
+        ['setup/add-telegram.sh'],
+        {
+          running: `Installing Telegram adapter and wiring @${botUsername}…`,
+          done: `Telegram adapter ready.`,
+        },
+        {
+          env: { TELEGRAM_BOT_TOKEN: token },
+          extraFields: { BOT_USERNAME: botUsername },
+        },
+      );
+      if (!install.ok) {
         fail(
           'Telegram install failed.',
-          'Re-run `bash setup/add-telegram.sh`, then retry `pnpm run setup:auto`.',
+          'Check the raw log under logs/setup-steps/, then retry `pnpm run setup:auto`.',
         );
       }
-      p.log.success('Telegram adapter installed.');
 
       const pair = await runPairTelegram();
       if (!pair.ok) {
@@ -592,6 +815,7 @@ async function main(): Promise<void> {
         (await askAgentName(DEFAULT_AGENT_NAME));
 
       const init = await runQuietChild(
+        'init-first-agent',
         'pnpm',
         [
           'exec', 'tsx', 'scripts/init-first-agent.ts',
@@ -604,6 +828,9 @@ async function main(): Promise<void> {
         {
           running: `Wiring ${agentName} to your Telegram chat…`,
           done: `${agentName} is wired — welcome DM incoming.`,
+        },
+        {
+          extraFields: { CHANNEL: 'telegram', AGENT_NAME: agentName, PLATFORM_ID: platformId },
         },
       );
       if (!init.ok) {
@@ -652,7 +879,41 @@ async function main(): Promise<void> {
     `${k.cyan('Open Claude Code:')}      claude`,
   ].join('\n');
   p.note(nextSteps, 'Next steps');
+  setupLog.complete(Date.now() - RUN_START);
   p.outro(k.green('Setup complete.'));
+}
+
+/**
+ * Bootstrap (nanoclaw.sh) normally initializes logs/setup.log and writes
+ * the bootstrap entry before we even boot. If someone runs `pnpm run
+ * setup:auto` directly, start a fresh progression log here so we don't
+ * append to a stale one from a previous run.
+ */
+function initProgressionLog(): void {
+  if (process.env.NANOCLAW_BOOTSTRAPPED === '1') return;
+  let commit = '';
+  try {
+    commit = spawnSync('git', ['rev-parse', '--short', 'HEAD'], {
+      encoding: 'utf-8',
+    }).stdout.trim();
+  } catch {
+    // git not available or not a repo — skip
+  }
+  let branch = '';
+  try {
+    branch = spawnSync('git', ['branch', '--show-current'], {
+      encoding: 'utf-8',
+    }).stdout.trim();
+  } catch {
+    // skip
+  }
+  setupLog.reset({
+    invocation: 'setup:auto (standalone)',
+    user: process.env.USER ?? 'unknown',
+    cwd: process.cwd(),
+    branch: branch || 'unknown',
+    commit: commit || 'unknown',
+  });
 }
 
 main().catch((err) => {
