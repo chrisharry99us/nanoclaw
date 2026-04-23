@@ -1,5 +1,5 @@
 import type { PendingApproval, PendingQuestion, Session } from '../types.js';
-import { getDb } from './connection.js';
+import { getDb, hasTable } from './connection.js';
 
 // ── Sessions ──
 
@@ -192,6 +192,35 @@ export function getAskQuestionRender(
   const a = getDb().prepare('SELECT title, options_json FROM pending_approvals WHERE approval_id = ?').get(id) as
     | { title: string; options_json: string }
     | undefined;
-  if (!a || !a.title) return undefined;
-  return { title: a.title, options: JSON.parse(a.options_json) };
+  if (a?.title) return { title: a.title, options: JSON.parse(a.options_json) };
+
+  // Channel-registration approval — options are fixed constants.
+  if (hasTable(getDb(), 'pending_channel_approvals')) {
+    const c = getDb().prepare('SELECT 1 FROM pending_channel_approvals WHERE messaging_group_id = ?').get(id);
+    if (c) {
+      return {
+        title: '📣 Channel registration',
+        options: [
+          { label: 'Approve', selectedLabel: '✅ Wired', value: 'approve' },
+          { label: 'Ignore', selectedLabel: '🙅 Ignored', value: 'reject' },
+        ],
+      };
+    }
+  }
+
+  // Unknown-sender approval — options are fixed constants.
+  if (hasTable(getDb(), 'pending_sender_approvals')) {
+    const s = getDb().prepare('SELECT 1 FROM pending_sender_approvals WHERE id = ?').get(id);
+    if (s) {
+      return {
+        title: '👤 New sender',
+        options: [
+          { label: 'Allow', selectedLabel: '✅ Allowed', value: 'approve' },
+          { label: 'Deny', selectedLabel: '❌ Denied', value: 'reject' },
+        ],
+      };
+    }
+  }
+
+  return undefined;
 }
